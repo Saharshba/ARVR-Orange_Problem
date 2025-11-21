@@ -191,8 +191,8 @@
 
         // --- GLB Loading ---
         const loader = new GLTFLoader();
-        // Loading gym_review model (must be exported as .glb or .gltf from Blender)
-        const glbPath = 'gym_review.glb'; // Update this to gym_review.glb
+        // Loading gym_model model (must be exported as .glb or .gltf from Blender)
+        const glbPath = 'gym_model.glb'; 
 
         loader.load(
             glbPath,
@@ -473,7 +473,7 @@
             },
             (error) => {
                 console.error('Error loading GLB model. Using placeholder ground.', error);
-                console.error('Make sure gym_review.glb is in the same directory as navigation.html');
+                console.error('Make sure gym_model.glb is in the same directory as navigation.html');
                 // If loading fails, keep the placeholder ground
                 // Set initial camera position above the placeholder ground
                 camera.position.set(0, 8.0, 5); 
