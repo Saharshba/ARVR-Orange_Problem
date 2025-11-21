@@ -47,3 +47,14 @@ Space – Jump
 Esc – Release mouse lock / cursor
 
 
+## High-Resolution Assets
+
+The full-resolution 3D assets are stored in Google Drive because they are larger than GitHub’s file size limit.
+
+- Blender source file (`gym_modeling.blend`):  
+  [Download from GoogleDrive](https://drive.google.com/file/d/1G9BNgqXFgbqC38rtw_PMjJknlJVdQFlj/view?usp=sharing)
+
+- High-resolution GLB model (`gym_model.glb`):  
+  [Download from GoogleDrive](https://drive.google.com/file/d/12lPFk8HZfvIb_6R-lw7SMm0vdAIqAVH4/view?usp=sharing)
+
+After downloading, place these files in the same folder as `gym_model_navigation.html` on your local machine to use them with the Namma gym demo.
