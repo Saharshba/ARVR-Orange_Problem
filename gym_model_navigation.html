@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>First-Person GLB Explorer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: 'Inter', sans-serif; }
+        canvas { display: block; }
+        #info-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            padding: 1rem;
+            text-align: center;
+            color: white;
+            background: rgba(0, 0, 0, 0.7);
+            pointer-events: none; /* Allows mouse clicks to pass through */
+            transition: opacity 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+    <div id="info-overlay" class="rounded-b-lg shadow-xl">
+        <h1 class="text-xl font-bold mb-2">3D Explorer (First-Person)</h1>
+        <p class="text-sm">
+            Click anywhere to enter the scene. <br>
+            Controls: <span class="font-mono bg-gray-800 p-1 rounded">W A S D</span> to Move | <span class="font-mono bg-gray-800 p-1 rounded">SPACE</span> to Jump | <span class="font-mono bg-gray-800 p-1 rounded">Mouse</span> to Look | <span class="font-mono bg-gray-800 p-1 rounded">ESC</span> to Exit
+        </p>
+    </div>
+    <div id="blocker" style="width: 100%; height: 100%; position: absolute; background-color: rgba(0, 0, 0, 0.5); display: none;">
+        <div class="flex flex-col items-center justify-center h-full">
+            <p class="text-white text-3xl font-bold">CLICK TO PLAY</p>
+            <p class="text-gray-300 text-lg mt-4"> (Use WASD + Mouse) </p>
+        </div>
+    </div>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+        import { Reflector } from 'three/addons/objects/Reflector.js';
+
+        // --- Scene Setup ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setClearColor(0x87CEEB); // Sky blue background
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambientLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        directionalLight.position.set(5, 10, 7);
+        directionalLight.castShadow = true;
+        directionalLight.shadow.mapSize.width = 2048;
+        directionalLight.shadow.mapSize.height = 2048;
+        directionalLight.shadow.camera.near = 0.5;
+        directionalLight.shadow.camera.far = 50;
+        directionalLight.shadow.camera.left = -10;
+        directionalLight.shadow.camera.right = 10;
+        directionalLight.shadow.camera.top = 10;
+        directionalLight.shadow.camera.bottom = -10;
+        scene.add(directionalLight);
+
+        // --- Placeholder Ground (If no GLB is loaded) ---
+        const geometry = new THREE.PlaneGeometry(50, 50);
+        const material = new THREE.MeshPhongMaterial({ color: 0x4CAF50, side: THREE.DoubleSide });
+        const ground = new THREE.Mesh(geometry, material);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.y = 0;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // --- Collision Detection Setup ---
+        let collisionObjects = [];
+        const raycaster = new THREE.Raycaster();
+        const collisionDistance = 1.0; // Distance to check for collisions (increased for better blocking)
+
+        // --- Audio Setup ---
+        const listener = new THREE.AudioListener();
+        camera.add(listener);
+
+        const treadmillSound = new THREE.PositionalAudio(listener);
+        const audioLoader = new THREE.AudioLoader();
+        let treadmillAudioBufferLoaded = false;
+        let treadmillAudioAttempted = false; // prevent spamming play calls
+        let audioStatusEl = null; // debug overlay element
+        let cameraStatusEl = null; // shows camera angle when on treadmill
+        // UI beep sound for scanner interaction (non-positional)
+        const beepSound = new THREE.Audio(listener);
+        let beepAudioBufferLoaded = false;
+        
+        // Speaker audio system - multiple positional audio sources for Lautsprecher_Material objects
+        let speakerObjects = []; // Array to store {mesh, audio, position} for each speaker
+        let speakerAudioBufferLoaded = false;
+        let speakerAudioBuffer = null;
+        
+        // Load treadmill sound - ensure a user gesture (pointer lock) will allow playback
+        audioLoader.load(
+            'treadmill.mp3',
+            (buffer) => {
+                treadmillSound.setBuffer(buffer);
+                treadmillSound.setLoop(true);
+                treadmillSound.setVolume(0.85);
+                treadmillAudioBufferLoaded = true;
+                console.log('Treadmill audio loaded successfully');
+            },
+            (xhr) => {
+                if (xhr.lengthComputable) {
+                    console.log((xhr.loaded / xhr.total * 100).toFixed(2) + '% treadmill audio loaded');
+                }
+            },
+            (err) => {
+                console.warn('Audio file not found. Please ensure treadmill.mp3 exists.');
+            }
+        );
+        // Load scanner beep sound
+        audioLoader.load(
+            'beep.mp3',
+            (buffer) => {
+                beepSound.setBuffer(buffer);
+                beepSound.setLoop(false);
+                beepSound.setVolume(0.8);
+                beepAudioBufferLoaded = true;
+                console.log('Beep audio loaded successfully');
+            },
+            (xhr) => {
+                if (xhr.lengthComputable) {
+                    console.log((xhr.loaded / xhr.total * 100).toFixed(2) + '% beep audio loaded');
+                }
+            },
+            (err) => {
+                console.warn('Audio file not found. Please ensure beep.mp3 exists.');
+            }
+        );
+        
+        // Load speaker sound (song.mp3) - will be used for all Lautsprecher_Material objects
+        audioLoader.load(
+            'song.mp3',
+            (buffer) => {
+                speakerAudioBuffer = buffer;
+                speakerAudioBufferLoaded = true;
+                console.log('🔊 Speaker audio (song.mp3) loaded successfully');
+                console.log('🔊 Buffer duration:', buffer.duration, 'seconds');
+                // Initialize audio for any speakers that were already found
+                console.log('🔊 Calling initializeSpeakerAudio from buffer load callback');
+                initializeSpeakerAudio();
+            },
+            (xhr) => {
+                if (xhr.lengthComputable) {
+                    console.log('🔊 ' + (xhr.loaded / xhr.total * 100).toFixed(2) + '% speaker audio loaded');
+                }
+            },
+            (err) => {
+                console.error('❌ Speaker audio file not found. Please ensure song.mp3 exists.', err);
+            }
+        );
+        
+        let treadmillPosition = new THREE.Vector3();
+        let treadmillObject = null;
+        let doorPanelNode = null;
+        let scannerNodes = [];
+        const interactionRange = 20.0; // meters (increased)
+
+        // Door sliding state
+        let doorClosedLocalPos = null;
+        let doorSlideAxisLocal = null; // THREE.Vector3 in local space (X or Z)
+        let doorSlideDist = 0; // how far to slide when fully open
+        let doorOpenAmount = 0; // 0..1
+        let doorTargetAmount = 0; // 0..1
+        let doorAutoCloseAt = null; // ms timestamp
+        const doorAnimSpeed = 1.2; // units of amount per second
+
+        // --- Mirror Setup ---
+        let mirror = null;
+
+        // --- GLB Loading ---
+        const loader = new GLTFLoader();
+        // Loading gym_review model (must be exported as .glb or .gltf from Blender)
+        const glbPath = 'gym_review.glb'; // Update this to gym_review.glb
+
+        loader.load(
+            glbPath,
+            (gltf) => {
+                console.log('GLB model loaded successfully:', glbPath);
+                
+                // Remove the placeholder ground if the model loads successfully
+                scene.remove(ground);
+
+                // Add the loaded model to the scene
+                const model = gltf.scene;
+                // You might need to adjust the position, scale, and rotation of your model
+                model.position.set(0, 0, 0); 
+                model.scale.set(1, 1, 1);
+                
+                // Enable shadows and collect collision objects
+                const treadmillNameMatches = [];
+                const treadmillMeshes = [];
+                model.traverse((node) => {
+                    const nameRaw = node.name || '';
+                    const lowerName = nameRaw.toLowerCase();
+                    if (node.isMesh) {
+                        node.castShadow = true;
+                        node.receiveShadow = true;
+                        collisionObjects.push(node);
+                        
+                        // Check if this mesh has "treadmill" in its name
+                        if (lowerName.includes('treadmill')) {
+                            treadmillNameMatches.push(nameRaw);
+                            treadmillMeshes.push(node);
+                            // Add to collision objects again to ensure it's prioritized
+                            collisionObjects.push(node);
+                            console.log('Treadmill mesh added to collision: "' + nameRaw + '"');
+                            console.log('  Position:', node.position);
+                            console.log('  Geometry:', node.geometry);
+                            if (node.geometry.boundingBox) {
+                                console.log('  Bounding box:', node.geometry.boundingBox);
+                            } else {
+                                node.geometry.computeBoundingBox();
+                                console.log('  Bounding box (computed):', node.geometry.boundingBox);
+                            }
+                            
+                            // Set the first treadmill mesh as the main treadmill object
+                            if (!treadmillObject) {
+                                treadmillObject = node;
+                                node.getWorldPosition(treadmillPosition);
+                            }
+                        }
+
+                        // Apply materials: Cube.022 as glass, Door_Panel as window (clear, subtle tint)
+                        if (lowerName.includes('cube.022')) {
+                            const count = applyGlassToNode(node);
+                            console.log(`Applied GLASS to ${count} mesh(es) under`, nameRaw);
+                        }
+                        if (lowerName.includes('door_panel') || lowerName.includes('door panel')) {
+                            const count = applyWindowToNode(node);
+                            console.log(`Applied WINDOW to ${count} mesh(es) under`, nameRaw);
+                        }
+
+                        // Ensure walls render from both sides when viewed from inside
+                        if (lowerName.includes('wall')) {
+                            if (Array.isArray(node.material)) {
+                                node.material.forEach(m => { if (m) m.side = THREE.DoubleSide; });
+                            } else if (node.material) {
+                                node.material.side = THREE.DoubleSide;
+                            }
+                            console.log('Set DoubleSide on wall mesh:', nameRaw);
+                        }
+
+                        // Ensure Door_Panel meshes are collidable
+                        if (lowerName.includes('door_panel') || lowerName.includes('door panel')) {
+                            collisionObjects.push(node);
+                            doorPanelNode = doorPanelNode || node;
+                            console.log('Door_Panel mesh added to collision:', nameRaw);
+                        }
+
+                        // Collect scanners for interaction
+                        if (lowerName.includes('scanner')) {
+                            scannerNodes.push(node);
+                            console.log('Scanner detected:', nameRaw);
+                        }
+                        
+                        // Collect objects with "Lautsprecher_Material" in name for speaker audio
+                        if (nameRaw.includes('Lautsprecher_Material') || lowerName.includes('lautsprecher')) {
+                            const worldPos = new THREE.Vector3();
+                            node.getWorldPosition(worldPos);
+                            speakerObjects.push({
+                                mesh: node,
+                                audio: null, // will be created when buffer loads
+                                position: worldPos.clone()
+                            });
+                            console.log('🔊 Speaker object detected:', nameRaw, 'at position:', worldPos);
+                        }
+                    }
+                    // If the node is a group named Door_Panel or Cube.022 container, apply to its children too
+                    if (!node.isMesh) {
+                        if (lowerName.includes('cube.022')) {
+                            const count = applyGlassToNode(node);
+                            console.log(`Applied GLASS to ${count} mesh(es) under group`, nameRaw);
+                        }
+                        if (lowerName.includes('door_panel') || lowerName.includes('door panel')) {
+                            const count = applyWindowToNode(node);
+                            console.log(`Applied WINDOW to ${count} mesh(es) under group`, nameRaw);
+                            // mark group as door panel reference for camera placement
+                            doorPanelNode = doorPanelNode || node;
+                        }
+                        if (lowerName.includes('wall')) {
+                            node.traverse((child) => {
+                                if (child.isMesh) {
+                                    if (Array.isArray(child.material)) {
+                                        child.material.forEach(m => { if (m) m.side = THREE.DoubleSide; });
+                                    } else if (child.material) {
+                                        child.material.side = THREE.DoubleSide;
+                                    }
+                                }
+                            });
+                            console.log('Set DoubleSide on wall group:', nameRaw);
+                        }
+                        if (lowerName.includes('scanner')) {
+                            scannerNodes.push(node);
+                            console.log('Scanner (group) detected:', nameRaw);
+                        }
+                        
+                        // Collect groups with "Lautsprecher_Material" in name
+                        if (nameRaw.includes('Lautsprecher_Material') || lowerName.includes('lautsprecher')) {
+                            const worldPos = new THREE.Vector3();
+                            node.getWorldPosition(worldPos);
+                            speakerObjects.push({
+                                mesh: node,
+                                audio: null,
+                                position: worldPos.clone()
+                            });
+                            console.log('🔊 Speaker group detected:', nameRaw, 'at position:', worldPos);
+                        }
+                    }
+                });
+                console.log('Detected treadmill-like mesh names:', treadmillNameMatches);
+                console.log('Total treadmill meshes added to collision:', treadmillMeshes.length);
+                
+                scene.add(model);
+                console.log('Collision objects loaded:', collisionObjects.length);
+                // Make sure world matrices are up to date before querying world positions
+                model.updateMatrixWorld(true);
+                
+                // Initialize speaker audio now that the model is loaded
+                console.log('🔊 Total speaker objects found:', speakerObjects.length);
+                if (speakerObjects.length === 0) {
+                    console.warn('⚠️ No speaker objects found! Make sure objects have "Lautsprecher_Material" or "lautsprecher" in their name');
+                }
+                if (speakerAudioBufferLoaded) {
+                    console.log('🔊 Audio buffer already loaded, initializing speakers now');
+                    initializeSpeakerAudio();
+                } else {
+                    console.log('🔊 Audio buffer not loaded yet, will initialize when ready');
+                }
+                
+                // Create mirror wall at specified global coordinates
+                const mirrorGeometry = new THREE.PlaneGeometry(50, 18);
+                mirror = new Reflector(mirrorGeometry, {
+                    clipBias: 0.003,
+                    textureWidth: window.innerWidth * window.devicePixelRatio,
+                    textureHeight: window.innerHeight * window.devicePixelRatio,
+                    color: 0x889999
+                });
+                
+                // Position the mirror at exact coordinates
+                // Since mirror is rotated 90 degrees, moving it "right" when looking at it means adjusting Z
+                mirror.position.set(-47.959, 11.307, -8);
+                mirror.rotation.y = Math.PI / 2; // 90 degrees rotation
+                scene.add(mirror);
+                console.log('Mirror created at:', mirror.position);
+
+                // Position the treadmill sound at the mirror location (acts as ambient source there)
+                treadmillSound.position.copy(mirror.position);
+                treadmillSound.setRefDistance(4.5);
+                treadmillSound.setMaxDistance(20);
+                treadmillSound.setVolume(0.85);
+                scene.add(treadmillSound);
+                console.log('Treadmill sound source moved to mirror position');
+                audioStatusEl = document.createElement('div');
+                audioStatusEl.style.position = 'absolute';
+                audioStatusEl.style.bottom = '8px';
+                audioStatusEl.style.left = '8px';
+                audioStatusEl.style.padding = '4px 8px';
+                audioStatusEl.style.background = 'rgba(0,0,0,0.55)';
+                audioStatusEl.style.color = '#fff';
+                audioStatusEl.style.fontFamily = 'monospace';
+                audioStatusEl.style.fontSize = '12px';
+                audioStatusEl.style.pointerEvents = 'none';
+                audioStatusEl.textContent = 'Audio: initializing';
+                document.body.appendChild(audioStatusEl);
+                updateAudioStatus();
+
+                // Create camera status overlay (hidden by default)
+                cameraStatusEl = document.createElement('div');
+                cameraStatusEl.style.position = 'absolute';
+                cameraStatusEl.style.bottom = '8px';
+                cameraStatusEl.style.right = '8px';
+                cameraStatusEl.style.padding = '4px 8px';
+                cameraStatusEl.style.background = 'rgba(0,0,0,0.55)';
+                cameraStatusEl.style.color = '#fff';
+                cameraStatusEl.style.fontFamily = 'monospace';
+                cameraStatusEl.style.fontSize = '12px';
+                cameraStatusEl.style.pointerEvents = 'none';
+                cameraStatusEl.style.display = 'none';
+                cameraStatusEl.textContent = 'Cam: --';
+                document.body.appendChild(cameraStatusEl);
+
+                // Find the highest point of the loaded model's bounding box
+                const box = new THREE.Box3().setFromObject(model);
+                const modelHeight = box.max.y - box.min.y;
+                const lowestY = box.min.y;
+                
+                // Set the initial camera position: place near Door_Panel if available, keeping same height
+                const initialHeight = lowestY + 8.0;
+                if (doorPanelNode) {
+                    const dpWorldPos = new THREE.Vector3();
+                    const dpWorldQuat = new THREE.Quaternion();
+                    doorPanelNode.getWorldPosition(dpWorldPos);
+                    doorPanelNode.getWorldQuaternion(dpWorldQuat);
+
+                    // Determine panel normal using thinnest dimension of its bounding box
+                    const dpBox = new THREE.Box3().setFromObject(doorPanelNode);
+                    const dpSize = new THREE.Vector3();
+                    dpBox.getSize(dpSize);
+                    let chosenAxis = 'z';
+                    let localAxis = new THREE.Vector3(0, 0, 1); // default Z
+                    if (dpSize.x <= dpSize.y && dpSize.x <= dpSize.z) {
+                        chosenAxis = 'x';
+                        localAxis.set(1, 0, 0);
+                    } else if (dpSize.z <= dpSize.x && dpSize.z <= dpSize.y) {
+                        chosenAxis = 'z';
+                        localAxis.set(0, 0, 1);
+                    } else {
+                        // Y is thinnest; avoid moving vertically — fall back to Z axis
+                        chosenAxis = 'z';
+                        localAxis.set(0, 0, 1);
+                    }
+
+                    const normalWorld = localAxis.clone().applyQuaternion(dpWorldQuat).normalize();
+                    const doorPanelSpawnOffset = 10.0; // spawn distance from the Door_Panel
+                    const offset = normalWorld.multiplyScalar(-doorPanelSpawnOffset); // other side
+                    console.log('[Door_Panel] worldPos:', dpWorldPos, 'bbox size:', dpSize, 'axis:', chosenAxis, 'normal:', normalWorld, 'offset:', offset);
+                    // User-specified spawn: keep height, set Z to -120 explicitly
+                    camera.position.set(dpWorldPos.x + offset.x, initialHeight, -120);
+                    // Rotate camera 180 degrees to face the door panel
+                    camera.rotation.y = Math.PI;
+                    console.log('Camera positioned near Door_Panel at (forced Z=-120):', camera.position);
+                } else {
+                    camera.position.set(0, initialHeight, 5);
+                    console.log('Camera positioned at default start:', camera.position);
+                }
+
+                // Initialize door sliding parameters (local axis and distance)
+                if (doorPanelNode) {
+                    // Cache closed local position
+                    doorClosedLocalPos = doorPanelNode.position.clone();
+                    // Determine slide axis from bounding box size (prefer larger of X/Z; avoid Y)
+                    const dpBox = new THREE.Box3().setFromObject(doorPanelNode);
+                    const dpSize = new THREE.Vector3();
+                    dpBox.getSize(dpSize);
+                    if (dpSize.x >= dpSize.z) {
+                        doorSlideAxisLocal = new THREE.Vector3(1, 0, 0); // slide along local X
+                        doorSlideDist = dpSize.x + 0.1;
+                    } else {
+                        doorSlideAxisLocal = new THREE.Vector3(0, 0, 1); // slide along local Z
+                        doorSlideDist = dpSize.z + 0.1;
+                    }
+                    console.log('[Door] Initialized slide axis local:', doorSlideAxisLocal, 'dist:', doorSlideDist);
+                }
+            },
+            (xhr) => {
+                // Optional: Loading progress callback
+                if (xhr.lengthComputable) {
+                    const percent = (xhr.loaded / xhr.total) * 100;
+                    console.log('GLB load progress: ' + percent.toFixed(2) + '% loaded');
+                }
+            },
+            (error) => {
+                console.error('Error loading GLB model. Using placeholder ground.', error);
+                console.error('Make sure gym_review.glb is in the same directory as navigation.html');
+                // If loading fails, keep the placeholder ground
+                // Set initial camera position above the placeholder ground
+                camera.position.set(0, 8.0, 5); 
+            }
+        );
+
+
+        // --- Controls Setup ---
+        let controls;
+        const blocker = document.getElementById('blocker');
+        const infoOverlay = document.getElementById('info-overlay');
+
+        // PointerLockControls handles the mouse look
+        controls = new PointerLockControls(camera, document.body);
+
+        const onLock = () => {
+            blocker.style.display = 'none';
+            infoOverlay.style.opacity = '0.2'; // Dim the info
+            if (listener.context.state === 'suspended') {
+                listener.context.resume().then(() => {
+                    console.log('Audio context resumed');
+                    updateAudioStatus();
+                });
+            }
+            if (treadmillAudioBufferLoaded && !treadmillSound.isPlaying) {
+                try {
+                    treadmillSound.play();
+                    console.log('[Audio] Forced play after pointer lock');
+                } catch (e) {
+                    console.warn('[Audio] Forced play failed:', e);
+                }
+            }
+            // Start playing all speaker audio sources
+            console.log('🔊 Attempting to start speaker audio. Buffer loaded:', speakerAudioBufferLoaded, '| Speaker count:', speakerObjects.length);
+            if (speakerAudioBufferLoaded) {
+                for (const speakerObj of speakerObjects) {
+                    if (speakerObj.audio) {
+                        if (!speakerObj.audio.isPlaying) {
+                            try {
+                                speakerObj.audio.play();
+                                console.log('🔊 [Speaker Audio] Started playing for:', speakerObj.mesh.name);
+                            } catch (e) {
+                                console.warn('❌ [Speaker Audio] Play failed for', speakerObj.mesh.name, ':', e);
+                            }
+                        } else {
+                            console.log('🔊 [Speaker Audio] Already playing for:', speakerObj.mesh.name);
+                        }
+                    } else {
+                        console.warn('⚠️ [Speaker Audio] No audio object for:', speakerObj.mesh.name);
+                    }
+                }
+            } else {
+                console.warn('⚠️ Speaker audio buffer not loaded yet');
+            }
+            updateAudioStatus();
+        };
+
+        const onUnlock = () => {
+            blocker.style.display = 'block';
+            infoOverlay.style.opacity = '1'; // Show the info clearly
+        };
+
+        controls.addEventListener('lock', onLock);
+        controls.addEventListener('unlock', onUnlock);
+
+        document.body.addEventListener('click', () => {
+            // Request pointer lock only if it's not already locked
+            if (!controls.isLocked) {
+                controls.lock();
+            }
+        });
+
+        // Initially show the blocker
+        onUnlock(); 
+
+        // --- Movement Variables and Input Handlers ---
+        let moveForward = false;
+        let moveBackward = false;
+        let moveLeft = false;
+        let moveRight = false;
+        let canJump = false;
+
+        let velocity = new THREE.Vector3();
+        const direction = new THREE.Vector3();
+        const gravity = 9.8; // Standard gravity acceleration (m/s^2)
+        const runSpeed = 100.0; // Increased movement speed
+        const jumpVelocity = 6.0;
+        let prevTime = performance.now();
+
+        const onKeyDown = (event) => {
+            if (!controls.isLocked) return;
+
+            switch (event.code) {
+                case 'KeyW':
+                    moveBackward = true;
+                    break;
+                case 'KeyA':
+                    moveRight = true;
+                    break;
+                case 'KeyS':
+                    moveForward = true;
+                    break;
+                case 'KeyD':
+                    moveLeft = true;
+                    break;
+                case 'KeyQ':
+                    // Interact with nearest scanner if in range
+                    tryInteract();
+                    break;
+                case 'Space':
+                    if (canJump === true) {
+                        velocity.y += jumpVelocity; // Apply jump force
+                        canJump = false;
+                    }
+                    break;
+            }
+        };
+
+        const onKeyUp = (event) => {
+            if (!controls.isLocked) return;
+
+            switch (event.code) {
+                case 'KeyW':
+                    moveBackward = false;
+                    break;
+                case 'KeyA':
+                    moveRight = false;
+                    break;
+                case 'KeyS':
+                    moveForward = false;
+                    break;
+                case 'KeyD':
+                    moveLeft = false;
+                    break;
+            }
+        };
+
+        document.addEventListener('keydown', onKeyDown);
+        document.addEventListener('keyup', onKeyUp);
+
+        // --- Audio Debug Helpers ---
+        function updateAudioStatus() {
+            if (!audioStatusEl) return;
+            const ctxState = listener.context.state;
+            const playing = treadmillSound.isPlaying ? 'playing' : 'stopped';
+            const loaded = treadmillAudioBufferLoaded ? 'loaded' : 'loading';
+            audioStatusEl.textContent = `Audio: ${playing} | Buffer: ${loaded} | Ctx: ${ctxState}`;
+        }
+
+        // --- Speaker Audio Initialization ---
+        function initializeSpeakerAudio() {
+            if (!speakerAudioBuffer) {
+                console.log('🔊 Cannot initialize speaker audio yet - buffer not ready');
+                return;
+            }
+            
+            if (speakerObjects.length === 0) {
+                console.log('🔊 Cannot initialize speaker audio yet - no speaker objects found');
+                return;
+            }
+            
+            console.log('🔊 Initializing audio for', speakerObjects.length, 'speaker objects');
+            
+            for (const speakerObj of speakerObjects) {
+                if (speakerObj.audio) {
+                    console.log('🔊 Speaker already has audio:', speakerObj.mesh.name);
+                    continue; // already initialized
+                }
+                
+                // Create a positional audio source for this speaker
+                const audio = new THREE.PositionalAudio(listener);
+                audio.setBuffer(speakerAudioBuffer);
+                audio.setLoop(true);
+                audio.setRefDistance(5);  // Distance at which volume starts to decrease
+                audio.setMaxDistance(80); // Maximum distance audio can be heard
+                audio.setVolume(0.6);
+                
+                // Attach audio to the mesh
+                speakerObj.mesh.add(audio);
+                speakerObj.audio = audio;
+                
+                console.log('🔊 Speaker audio attached to:', speakerObj.mesh.name, '| Position:', speakerObj.position);
+            }
+            
+            console.log('🔊 Audio initialization complete for all speakers');
+        }
+
+        // --- Interaction Helpers ---
+        function getNearestScannerDistance() {
+            if (!scannerNodes.length) return Infinity;
+            let minD = Infinity;
+            const tmp = new THREE.Vector3();
+            for (const n of scannerNodes) {
+                n.getWorldPosition(tmp);
+                const d = tmp.distanceTo(camera.position);
+                if (d < minD) minD = d;
+            }
+            return minD;
+        }
+
+        function tryInteract() {
+            const d = getNearestScannerDistance();
+            if (d <= interactionRange && doorPanelNode) {
+                // Open the door and set auto-close timer
+                doorTargetAmount = 1.0;
+                doorAutoCloseAt = performance.now() + 10000; // 10 seconds
+                console.log(`[Door] Interaction: opening (d=${d.toFixed(2)})`);
+                // Play beep when interacting near scanner
+                if (beepAudioBufferLoaded) {
+                    try {
+                        if (beepSound.isPlaying) beepSound.stop();
+                        beepSound.play();
+                    } catch (e) {
+                        console.warn('Beep play failed:', e);
+                    }
+                }
+            } else {
+                console.log('[Door] Interaction ignored: out of range or missing door panel');
+            }
+        }
+
+        // --- Material Helpers ---
+        function makeGlassMaterial() {
+            return new THREE.MeshPhysicalMaterial({
+                color: 0xffffff,
+                metalness: 0.0,
+                roughness: 0.01,          // very low for minimal blur
+                transmission: 0.98,       // high clarity
+                thickness: 0.02,          // very thin to avoid fogging
+                ior: 1.45,
+                attenuationColor: new THREE.Color(0xffffff),
+                attenuationDistance: 100, // reduce internal tinting/haze
+                envMapIntensity: 1.0,
+                transparent: true,
+                opacity: 0.88,            // subtle white presence while transparent
+                side: THREE.DoubleSide,
+                depthWrite: false
+            });
+        }
+
+        // Window material (simpler, clearer look with subtle tint, no transmission blur)
+        function makeWindowMaterial() {
+            return new THREE.MeshStandardMaterial({
+                color: 0xeef5ff,          // subtle whitish/blue tint
+                metalness: 0.0,
+                roughness: 0.1,           // slight surface reflection
+                transparent: true,
+                opacity: 0.6,             // more see-through, window-like
+                side: THREE.DoubleSide,
+                depthWrite: false
+            });
+        }
+
+        function applyGlassToNode(node) {
+            const glassMat = makeGlassMaterial();
+            if (node.isMesh) {
+                if (Array.isArray(node.material)) {
+                    node.material = node.material.map(() => glassMat.clone());
+                } else {
+                    node.material = glassMat.clone();
+                }
+                node.castShadow = false;
+                return 1;
+            }
+            // If this is not a mesh, try its children
+            let applied = 0;
+            if (node.children && node.children.length) {
+                node.traverse((child) => {
+                    if (child.isMesh) {
+                        if (Array.isArray(child.material)) {
+                            child.material = child.material.map(() => glassMat.clone());
+                        } else {
+                            child.material = glassMat.clone();
+                        }
+                        child.castShadow = false;
+                        applied++;
+                    }
+                });
+            }
+            return applied;
+        }
+
+        function applyWindowToNode(node) {
+            const wndMat = makeWindowMaterial();
+            if (node.isMesh) {
+                if (Array.isArray(node.material)) {
+                    node.material = node.material.map(() => wndMat.clone());
+                } else {
+                    node.material = wndMat.clone();
+                }
+                node.castShadow = false;
+                return 1;
+            }
+            let applied = 0;
+            if (node.children && node.children.length) {
+                node.traverse((child) => {
+                    if (child.isMesh) {
+                        if (Array.isArray(child.material)) {
+                            child.material = child.material.map(() => wndMat.clone());
+                        } else {
+                            child.material = wndMat.clone();
+                        }
+                        child.castShadow = false;
+                        applied++;
+                    }
+                });
+            }
+            return applied;
+        }
+
+        // --- Animation/Game Loop ---
+        function checkCollision(direction) {
+            raycaster.set(camera.position, direction);
+            const intersections = raycaster.intersectObjects(collisionObjects, true);
+            if (intersections.length > 0 && intersections[0].distance < collisionDistance) {
+                return {
+                    object: intersections[0].object.name,
+                    distance: intersections[0].distance.toFixed(2),
+                    direction: direction,
+                    point: intersections[0].point
+                };
+            }
+            return null;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const time = performance.now();
+            
+            // Handle treadmill positional audio - continuous play with distance-based volume fade
+            if (treadmillAudioBufferLoaded && mirror) {
+                // Start playing once and let it loop continuously
+                if (!treadmillSound.isPlaying) {
+                    try {
+                        treadmillSound.play();
+                        console.log('Mirror sound started (continuous loop)');
+                        updateAudioStatus();
+                    } catch (e) {
+                        console.warn('Play attempt failed:', e);
+                    }
+                }
+                
+                // Adjust volume based on distance (fade to 0 when far, max volume when close)
+                const distanceToSource = camera.position.distanceTo(mirror.position);
+                const maxAudibleDistance = 50; // Fully audible within this distance
+                const fadeDistance = 70; // Completely silent beyond this distance
+                
+                let volumeLevel = 0;
+                if (distanceToSource < maxAudibleDistance) {
+                    volumeLevel = 0.85; // Full volume
+                } else if (distanceToSource < fadeDistance) {
+                    // Linear fade between maxAudibleDistance and fadeDistance
+                    const fadeRange = fadeDistance - maxAudibleDistance;
+                    const distanceIntoFade = distanceToSource - maxAudibleDistance;
+                    volumeLevel = 0.85 * (1 - (distanceIntoFade / fadeRange));
+                } else {
+                    volumeLevel = 0; // Silent when far away
+                }
+                
+                treadmillSound.setVolume(volumeLevel);
+            }
+            
+            if (controls.isLocked === true) {
+                const delta = (time - prevTime) / 1000; // Time elapsed since last frame in seconds
+
+                // 1. Apply Gravity (Vertical Movement/Physics)
+                velocity.y -= gravity * delta; 
+                
+                // 1a. Update door animation (smooth open/close)
+                if (doorPanelNode && doorSlideAxisLocal && doorClosedLocalPos) {
+                    // auto-close timer
+                    if (doorAutoCloseAt && time >= doorAutoCloseAt) {
+                        doorTargetAmount = 0.0;
+                        doorAutoCloseAt = null;
+                        console.log('[Door] Auto-closing');
+                    }
+                    const diff = doorTargetAmount - doorOpenAmount;
+                    const step = doorAnimSpeed * delta;
+                    if (Math.abs(diff) > 1e-4) {
+                        const inc = Math.sign(diff) * Math.min(Math.abs(diff), step);
+                        doorOpenAmount = THREE.MathUtils.clamp(doorOpenAmount + inc, 0, 1);
+                        // ease in/out for smoothness
+                        const t = 0.5 * (1 - Math.cos(Math.PI * doorOpenAmount));
+                        // Reverse direction: slide to the opposite side
+                        const offsetLocal = doorSlideAxisLocal.clone().multiplyScalar(-doorSlideDist * t);
+                        // set local position = closed + offset
+                        doorPanelNode.position.set(
+                            doorClosedLocalPos.x + offsetLocal.x,
+                            doorClosedLocalPos.y + offsetLocal.y,
+                            doorClosedLocalPos.z + offsetLocal.z
+                        );
+                    }
+                }
+                
+                // Check if standing on a treadmill (raycast downward)
+                const downwardRay = new THREE.Raycaster(camera.position, new THREE.Vector3(0, -1, 0));
+                const downwardIntersects = downwardRay.intersectObjects(collisionObjects, true);
+                
+                let onTreadmill = false;
+                let minHeight = 8.0; // Default floor height
+                
+                if (downwardIntersects.length > 0) {
+                    const groundObject = downwardIntersects[0].object;
+                    const groundDistance = downwardIntersects[0].distance;
+                    const groundY = camera.position.y - groundDistance;
+                    
+                    // Check if the object below has "treadmill" in its name
+                    if (groundObject.name && groundObject.name.toLowerCase().includes('treadmill')) {
+                        onTreadmill = true;
+                        minHeight = groundY + 10.0; // Treadmill surface + 2 units for standing height
+                    } else {
+                        minHeight = Math.max(groundY, 8.0); // Use detected ground or default floor
+                    }
+                }
+
+                // Update camera angle HUD when on treadmill
+                if (cameraStatusEl) {
+                    if (onTreadmill) {
+                        const yawDeg = THREE.MathUtils.radToDeg(camera.rotation.y).toFixed(1);
+                        const pitchDeg = THREE.MathUtils.radToDeg(camera.rotation.x).toFixed(1);
+                        cameraStatusEl.textContent = `On treadmill | Yaw: ${yawDeg}° | Pitch: ${pitchDeg}°`;
+                        cameraStatusEl.style.display = 'block';
+                    } else {
+                        cameraStatusEl.style.display = 'none';
+                    }
+                }
+                
+                // Keep the camera from falling through the floor or treadmill
+                if (camera.position.y < minHeight) {
+                    velocity.y = 0;
+                    camera.position.y = minHeight;
+                    canJump = true; // Allow jump only when grounded
+                }
+                
+                // 2. Handle WASD Movement
+                direction.z = Number(moveForward) - Number(moveBackward);
+                direction.x = Number(moveRight) - Number(moveLeft);
+                // direction.y is unused for ground movement
+
+                // Normalize direction vector to prevent faster diagonal movement
+                if (moveForward || moveBackward) direction.z *= runSpeed;
+                if (moveLeft || moveRight) direction.x *= runSpeed;
+                
+                // Apply drag/friction to horizontal movement for smoother stops
+                velocity.x -= velocity.x * 10.0 * delta;
+                velocity.z -= velocity.z * 10.0 * delta;
+
+                // Update horizontal velocity based on input
+                velocity.z += direction.z * delta;
+                velocity.x += direction.x * delta;
+
+                // Store previous position
+                const prevPosition = camera.position.clone();
+
+                // Move the controls (which moves the camera)
+                controls.moveRight(-velocity.x * delta);
+                controls.moveForward(-velocity.z * delta);
+
+                // Check for collisions in all directions
+                const directions = [
+                    new THREE.Vector3(1, 0, 0),   // right
+                    new THREE.Vector3(-1, 0, 0),  // left
+                    new THREE.Vector3(0, 0, 1),   // forward
+                    new THREE.Vector3(0, 0, -1),  // backward
+                ];
+
+                let collision = false;
+                let collisionInfo = null;
+                for (const dir of directions) {
+                    dir.applyQuaternion(camera.quaternion);
+                    const result = checkCollision(dir);
+                    if (result) {
+                        collision = true;
+                        collisionInfo = result;
+                        break;
+                    }
+                }
+
+                // If collision detected, revert to previous position
+                if (collision) {
+                    console.log('COLLISION DETECTED:', collisionInfo);
+                    camera.position.copy(prevPosition);
+                    velocity.x = 0;
+                    velocity.z = 0;
+                }
+
+                camera.position.y += velocity.y * delta; // Apply vertical movement
+
+            }
+
+            // Update previous time for next delta calculation
+            prevTime = time;
+            
+            // Render the scene
+            renderer.render(scene, camera);
+        }
+
+        // --- Window Resize Handling ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Start the animation loop after initial setup
+        animate();
+
+    </script>
+</body>
+</html>
